@@ -3,6 +3,8 @@ package otelsql
 import (
 	"context"
 	"database/sql/driver"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const (
@@ -24,11 +26,30 @@ func skippedQueryContext(_ context.Context, _ string, _ []driver.NamedValue) (dr
 	return nil, driver.ErrSkip
 }
 
+type attributeCtxKey struct{}
+
+func getAttributes(ctx context.Context) []attribute.KeyValue {
+	attrs, ok := ctx.Value(attributeCtxKey{}).([]attribute.KeyValue)
+	if !ok || attrs == nil {
+		attrs = make([]attribute.KeyValue, 0)
+	}
+	return attrs
+}
+
+// WithCutomAttributes adds additional OTel attributes to the context.
+// These attributes are added to metrics and spans generated for the query.
+func WithCustomAttributes(ctx context.Context, labels ...attribute.KeyValue) context.Context {
+	addedLabels := getAttributes(ctx)
+	new := append(addedLabels, labels...)
+	return context.WithValue(ctx, attributeCtxKey{}, new)
+}
+
 // queryStats records metrics for query.
 func queryStats(r methodRecorder, method string) queryContextFuncMiddleware {
 	return func(next queryContextFunc) queryContextFunc {
 		return func(ctx context.Context, query string, args []driver.NamedValue) (result driver.Rows, err error) {
-			end := r.Record(ctx, method)
+			attrs := getAttributes(ctx)
+			end := r.Record(ctx, method, attrs...)
 
 			defer func() {
 				end(err)
@@ -49,7 +70,11 @@ func queryTrace(t methodTracer, traceQuery queryTracer, method string) queryCont
 			ctx, end := t.Trace(ctx, method)
 
 			defer func() {
-				end(err, traceQuery(ctx, query, args)...)
+				labels := append(
+					getAttributes(ctx),
+					traceQuery(ctx, query, args)...,
+				)
+				end(err, labels...)
 			}()
 
 			result, err = next(ctx, query, args)
